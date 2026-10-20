@@ -373,7 +373,7 @@ static int chooseDelay(Mode m, PlayerObject* pl, PlayerBuf& st, int idx, bool do
 	c.half = half;
 
 	// obstaculos cercanos
-	std::vector<CCRect> near;
+	std::vector<CCRect> nearRects;
 	float xMax = c.x0 + vx * c.H + 80.f;
 	auto collect = [&](std::vector<GameObject*>& list) {
 		for (auto* o : list) {
@@ -383,13 +383,13 @@ static int chooseDelay(Mode m, PlayerObject* pl, PlayerBuf& st, int idx, bool do
 			CCRect r = o->getObjectRect();
 			r.origin.x += 1.f; r.origin.y += 1.f;
 			r.size.width -= 2.f; r.size.height -= 2.f;
-			near.push_back(r);
+			nearRects.push_back(r);
 		}
 	};
 	collect(g_hazards);
 	if (m == Mode::Wave && Mod::get()->getSettingValue<bool>("wave-solids")) collect(g_solids);
-	if (near.empty()) return 0;
-	c.rects = &near;
+	if (nearRects.empty()) return 0;
+	c.rects = &nearRects;
 
 	// 1) con retraso 0 sobrevive alguna ruta? -> pasa intacto
 	if (anyRouteSurvives(c, 0)) {
@@ -623,4 +623,75 @@ class $modify(BufPlayLayer, PlayLayer) {
 		g_hazards.clear();
 		g_solids.clear();
 		if (m_objects) {
-			for (auto* obj : C
+			for (auto* obj : CCArrayExt<GameObject*>(m_objects)) {
+				if (!obj) continue;
+				if (auto* ring = typeinfo_cast<RingObject*>(obj)) {
+					g_rings.push_back(ring);
+					continue;
+				}
+				if (obj->m_objectType == GameObjectType::Hazard) g_hazards.push_back(obj);
+				else if (obj->m_objectType == GameObjectType::Solid) g_solids.push_back(obj);
+			}
+		}
+
+		g_stage = Mod::get()->getSavedValue<int>("stage", 0);
+		if (g_stage < 0 || g_stage >= STAGE_COUNT) g_stage = 0;
+
+		// panel de log arriba a la derecha
+		if (optHud()) {
+			auto win = CCDirector::get()->getWinSize();
+			g_hud = CCLabelBMFont::create("", "chatFont.fnt");
+			g_hud->setAnchorPoint({1.f, 1.f});
+			g_hud->setAlignment(kCCTextAlignmentRight);
+			g_hud->setScale(0.55f);
+			g_hud->setOpacity(210);
+			g_hud->setPosition({win.width - 6.f, win.height - 6.f});
+			this->addChild(g_hud, 201);
+		}
+
+		if (!Mod::get()->getSettingValue<bool>("show-button")) return;
+
+		auto label = CCLabelBMFont::create(STAGES[g_stage].label, "bigFont.fnt");
+		label->setScale(0.45f);
+		label->setOpacity(160);
+		auto btn = CCMenuItemExt::createSpriteExtra(label, [label](CCObject*) {
+			g_stage = (g_stage + 1) % STAGE_COUNT;
+			Mod::get()->setSavedValue<int>("stage", g_stage);
+			label->setString(STAGES[g_stage].label);
+			hudLog(std::string("Etapa -> ") + STAGES[g_stage].label);
+		});
+		auto menu = CCMenu::create();
+		menu->setPosition({0, 0});
+		btn->setPosition({55.f, 18.f});
+		menu->addChild(btn);
+		this->addChild(menu, 200);
+	}
+
+	void postUpdate(float dt) {
+		PlayLayer::postUpdate(dt);
+		if (g_hud && g_hudDirty) {
+			g_hudDirty = false;
+			std::string text;
+			for (size_t k = 0; k < g_hudLines.size(); k++) {
+				if (k) text += "\n";
+				text += g_hudLines[k];
+			}
+			g_hud->setString(text.c_str());
+		}
+	}
+
+	void resetLevel() {
+		if (!g_last.empty() && g_tick > 0) hudLog("RESET | ultima: " + g_last);
+		PlayLayer::resetLevel();
+		resetBuffer();
+	}
+
+	void onQuit() {
+		resetBuffer();
+		g_hud = nullptr;
+		g_rings.clear();
+		g_hazards.clear();
+		g_solids.clear();
+		PlayLayer::onQuit();
+	}
+};
