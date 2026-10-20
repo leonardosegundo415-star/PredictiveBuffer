@@ -1,0 +1,56 @@
+{
+	"geode": "5.11.2",
+	"gd": {
+		"win": "2.2081",
+		"android": "2.2081"
+	},
+	"version": "v1.3.0",
+	"id": "ai.predictivebuffer",
+	"name": "Predictive Input Buffer",
+	"developer": "lilWC",
+	"description": "Trajectory-based press (rings/orbs) and wave input buffer. Mobile-ready.",
+	"settings": {
+		"show-button": {
+			"type": "bool",
+			"name": "Mostrar boton de etapa",
+			"description": "Boton en pantalla (abajo a la izquierda) para cambiar de etapa durante el nivel.",
+			"default": true
+		},
+		"ring-buffer": {
+			"type": "bool",
+			"name": "Buffer de aros y orbes",
+			"default": true
+		},
+		"wave-buffer": {
+			"type": "bool",
+			"name": "Buffer de wave (prediccion de hazards)",
+			"description": "Retrasa un cambio de direccion de la wave si la trayectoria predice un choque.",
+			"default": true
+		},
+		"wave-solids": {
+			"type": "bool",
+			"name": "Wave: considerar bloques solidos",
+			"description": "Ademas de pinchos/sierras. Puede dar falsos positivos al deslizarse sobre bloques.",
+			"default": false
+		},
+		"wave-horizon": {
+			"type": "int",
+			"name": "Wave: horizonte de prediccion (ticks)",
+			"default": 12,
+			"min": 4,
+			"max": 40
+		},
+		"wave-padding": {
+			"type": "float",
+			"name": "Wave: margen de seguridad (px)",
+			"default": 0.5,
+			"min": 0.0,
+			"max": 4.0
+		},
+		"log-saves": {
+			"type": "bool",
+			"name": "Registrar salvadas en el log",
+			"default": true
+		}
+	}
+}
