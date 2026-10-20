@@ -12,6 +12,7 @@
 #include <Geode/modify/PlayLayer.hpp>
 #include <cmath>
 #include <vector>
+#include <unordered_set>
 
 using namespace geode::prelude;
 
@@ -46,6 +47,8 @@ struct PlayerBuf {
 	float vx = 0.f, vy = 0.f, ay = 0.f;
 };
 static PlayerBuf g_p[2];
+// aros ya tocados por cada jugador (reemplaza m_hasBeenActivated, que no existe en estos bindings)
+static std::unordered_set<RingObject*> g_touched[2];
 
 static constexpr float RING_RADIUS = 30.f;
 
@@ -53,6 +56,8 @@ static void resetBuffer() {
 	g_tick = 0;
 	g_p[0] = PlayerBuf{};
 	g_p[1] = PlayerBuf{};
+	g_touched[0].clear();
+	g_touched[1].clear();
 }
 
 static int allLimit()  { return STAGES[g_stage].all; }
@@ -64,7 +69,7 @@ static bool optLog()   { return Mod::get()->getSettingValue<bool>("log-saves"); 
 
 // ---------------------------------------------------------------- aros
 static bool ringActivated(RingObject* r, bool p1) {
-	return p1 ? r->m_hasBeenActivatedP1 : r->m_hasBeenActivatedP2;
+	return g_touched[p1 ? 0 : 1].count(r) > 0;
 }
 
 static bool predictRingAhead(PlayerObject* pl, const PlayerBuf& st, bool p1, int limit) {
@@ -224,9 +229,9 @@ class $modify(BufBaseGameLayer, GJBaseGameLayer) {
 		GJBaseGameLayer::handleButton(false, button, isPlayer1);
 	}
 
-	void processCommands(float dt) {
-		g_tick++;
-		if (g_stage != 4) {
+	void processCommands(float dt, bool isHalfTick, bool isLastTick) {
+		if (!isHalfTick) g_tick++;
+		if (g_stage != 4 && !isHalfTick) {
 			for (int i = 0; i < 2; i++) {
 				auto& st = g_p[i];
 				if (st.queued && g_tick >= st.applyTick) {
@@ -245,8 +250,9 @@ class $modify(BufBaseGameLayer, GJBaseGameLayer) {
 			}
 		}
 
-		GJBaseGameLayer::processCommands(dt);
+		GJBaseGameLayer::processCommands(dt, isHalfTick, isLastTick);
 
+		if (isHalfTick) return;
 		PlayerObject* players[2] = {m_player1, m_player2};
 		for (int i = 0; i < 2; i++) {
 			auto* pl = players[i];
@@ -273,6 +279,7 @@ class $modify(BufBaseGameLayer, GJBaseGameLayer) {
 
 		int i = (player == m_player1) ? 0 : 1;
 		auto& st = g_p[i];
+		g_touched[i].insert(ring);
 
 		bool fire = false;
 		int saved = 0;
