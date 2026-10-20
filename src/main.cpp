@@ -44,14 +44,28 @@ static std::vector<GameObject*> g_hazards;
 static std::vector<GameObject*> g_solids;
 
 // ================================================================ ajustes
-static bool optRing()    { return Mod::get()->getSettingValue<bool>("ring-buffer"); }
-static bool optLand()    { return Mod::get()->getSettingValue<bool>("land-buffer"); }
-static bool optWave()    { return Mod::get()->getSettingValue<bool>("wave-buffer"); }
-static bool optVeh()     { return Mod::get()->getSettingValue<bool>("vehicle-buffer"); }
-static bool optSpam()    { return Mod::get()->getSettingValue<bool>("spam-guard"); }
-static bool optHud()     { return Mod::get()->getSettingValue<bool>("hud-readout"); }
-static bool optVerbose() { return Mod::get()->getSettingValue<bool>("hud-verbose"); }
-static bool optLog()     { return Mod::get()->getSettingValue<bool>("log-saves"); }
+static bool optRing() { return Mod::get()->getSettingValue<bool>("ring-buffer"); }
+static bool optLand() { return Mod::get()->getSettingValue<bool>("land-buffer"); }
+static bool optWave() { return Mod::get()->getSettingValue<bool>("wave-buffer"); }
+static bool optVeh()  { return Mod::get()->getSettingValue<bool>("vehicle-buffer"); }
+static bool optHud()  { return Mod::get()->getSettingValue<bool>("hud-readout"); }
+
+// Todo lo demas es automatico (pensado para celular).
+static constexpr int   SPAM_TICKS   = 4;    // inputs a <= 4 ticks (1 frame @60) cuentan como spam...
+static constexpr int   SPAM_STREAK  = 5;    // ...solo tras 5 seguidos
+static constexpr int   SAFETY_TICKS = 1;    // margen extra tras hallar el retraso
+static constexpr int   HUD_LINES    = 5;
+static constexpr float MARGIN_WAVE  = 2.0f; // holgura (px) que se exige a las rutas
+static constexpr float MARGIN_OTHER = 3.0f;
+
+// presupuesto de CPU automatico: ~25% del tiempo de frame medido (entre 0.5 y 4 ms)
+static double g_frameUs = 8333.0;
+static std::chrono::steady_clock::time_point g_lastFrame;
+static bool g_haveFrame = false;
+static int64_t autoBudgetUs() {
+	double b = g_frameUs * 0.25;
+	return (int64_t)std::max(500.0, std::min(4000.0, b));
+}
 
 // ================================================================ panel de log en pantalla
 static std::vector<std::string> g_hudLines;
@@ -61,11 +75,10 @@ static std::string g_last; // ultima decision, para el reporte al reiniciar
 
 static void hudLog(const std::string& s) {
 	g_last = s;
-	if (optLog()) log::info("[InputBuffer] {}", s);
+	log::info("[InputBuffer] {}", s);
 	if (!optHud()) return;
 	g_hudLines.push_back(s);
-	size_t maxLines = (size_t)std::max<int64_t>(3, Mod::get()->getSettingValue<int64_t>("hud-lines"));
-	while (g_hudLines.size() > maxLines) g_hudLines.erase(g_hudLines.begin());
+	while (g_hudLines.size() > (size_t)HUD_LINES) g_hudLines.erase(g_hudLines.begin());
 	g_hudDirty = true;
 }
 
@@ -238,7 +251,8 @@ struct SimCtx {
 	float swingDir0;
 	int H;
 	const Learn* L;
-	const std::vector<CCRect>* rects;
+	const std::vector<CCRect>* rects;   // hazards (letales al tocar)
+	const std::vector<CCRect>* solids;  // bloques solidos (wave: letal de lado, desliza por arriba/abajo)
 };
 
 // Simula H ticks. Entrada: prevDown durante `d` ticks, luego firstDown. Si futureK > 0, tras
@@ -292,6 +306,20 @@ static bool survives(const SimCtx& c, int d, int futureK) {
 		}
 		x += c.vx;
 		float y = yn * c.f;
+
+		// bloques solidos (solo wave): golpe de lado = muerte; por arriba/abajo desliza
+		if (c.mode == Mode::Wave && c.solids) {
+			for (auto& r : *c.solids) {
+				float ox = std::min(x + c.half, r.origin.x + r.size.width) - std::max(x - c.half, r.origin.x);
+				float oy = std::min(y + c.half, r.origin.y + r.size.height) - std::max(y - c.half, r.origin.y);
+				if (ox > 0.f && oy > 0.f) {
+					if (ox < oy * 0.8f) return false; // choque de lado
+					float cy = r.origin.y + r.size.height * 0.5f;
+					y = (y >= cy) ? (r.origin.y + r.size.height + c.half) : (r.origin.y - c.half);
+					yn = y * c.f;
+				}
+			}
+		}
 		for (auto& r : *c.rects) {
 			if (boxHit(r, x, y, c.half)) return false;
 		}
@@ -299,7 +327,9 @@ static bool survives(const SimCtx& c, int d, int futureK) {
 	return true;
 }
 
-static constexpr int FUTURE_K[] = {0, 1, 2, 3, 4, 6, 8, 12, 16, 24};
+// futuros que se prueban: sin mas cambios, o un cambio de input tras k ticks.
+// No se cuentan correcciones inmediatas (k = 1..6): no son humanas.
+static constexpr int FUTURE_K[] = {0, 8, 12, 16, 24};
 
 // true si ALGUNA ruta futura razonable sobrevive con retraso d
 static bool anyRouteSurvives(const SimCtx& c, int d) {
@@ -311,6 +341,8 @@ static bool anyRouteSurvives(const SimCtx& c, int d) {
 }
 
 // Elige cuantos ticks retrasar el input (0 = pasa al instante).
+//  - Si con retraso 0 ninguna ruta sobrevive (choque seguro): busca el primer retraso que salve.
+//  - Si sobrevive pero rozando (no aguanta una holgura extra): busca un retraso que de holgura.
 static int chooseDelay(Mode m, PlayerObject* pl, PlayerBuf& st, int idx, bool down) {
 	int limit = limitFor(m);
 	if (!pl || !st.haveLast || limit <= 0) return 0;
@@ -330,15 +362,14 @@ static int chooseDelay(Mode m, PlayerObject* pl, PlayerBuf& st, int idx, bool do
 		if (m == Mode::Cube && !pl->m_isOnGround) return 0; // lo cubre el buffer de aterrizaje
 		if (!st.warned[(int)m]) {
 			st.warned[(int)m] = true;
-			hudLog(std::string(modeName(m)) + ": aprendiendo fisica (sin ajuste todavia)");
+			hudLog(std::string(modeName(m)) + ": aprendiendo fisica");
 		}
 		return 0;
 	}
 
 	auto t0 = std::chrono::steady_clock::now();
-	int64_t budgetUs = Mod::get()->getSettingValue<int64_t>("cpu-budget-us");
+	int64_t budgetUs = autoBudgetUs();
 	auto over = [&]() {
-		if (budgetUs <= 0) return false;
 		auto us = std::chrono::duration_cast<std::chrono::microseconds>(
 			std::chrono::steady_clock::now() - t0).count();
 		return us > budgetUs;
@@ -346,7 +377,7 @@ static int chooseDelay(Mode m, PlayerObject* pl, PlayerBuf& st, int idx, bool do
 
 	SimCtx c{};
 	c.mode = m;
-	c.H = (int)Mod::get()->getSettingValue<int64_t>("wave-horizon");
+	c.H = std::min(40, std::max(12, limit + 10));
 	c.f = pl->m_isUpsideDown ? -1.f : 1.f;
 	c.x0 = pl->getPositionX();
 	c.vx = vx;
@@ -369,63 +400,74 @@ static int chooseDelay(Mode m, PlayerObject* pl, PlayerBuf& st, int idx, bool do
 		auto pr = pl->getObjectRect();
 		if (pr.size.width > 2.f && pr.size.width < 45.f) half = pr.size.width / 2.f;
 	}
-	half += (float)Mod::get()->getSettingValue<double>("wave-padding");
 	c.half = half;
 
 	// obstaculos cercanos
-	std::vector<CCRect> nearRects;
+	std::vector<CCRect> nearRects;   // hazards
+	std::vector<CCRect> nearSolids;  // bloques (solo wave)
 	float xMax = c.x0 + vx * c.H + 80.f;
-	auto collect = [&](std::vector<GameObject*>& list) {
+	auto collect = [&](std::vector<GameObject*>& list, std::vector<CCRect>& out, bool shrink) {
 		for (auto* o : list) {
 			if (!o) continue;
 			float ox = o->getPositionX();
 			if (ox < c.x0 - 80.f || ox > xMax) continue;
 			CCRect r = o->getObjectRect();
-			r.origin.x += 1.f; r.origin.y += 1.f;
-			r.size.width -= 2.f; r.size.height -= 2.f;
-			nearRects.push_back(r);
+			if (shrink) {
+				r.origin.x += 1.f; r.origin.y += 1.f;
+				r.size.width -= 2.f; r.size.height -= 2.f;
+			}
+			out.push_back(r);
 		}
 	};
-	collect(g_hazards);
-	if (m == Mode::Wave && Mod::get()->getSettingValue<bool>("wave-solids")) collect(g_solids);
-	if (nearRects.empty()) return 0;
+	collect(g_hazards, nearRects, true);
+	bool useSolids = (m == Mode::Wave);
+	if (useSolids) collect(g_solids, nearSolids, false);
+	if (nearRects.empty() && nearSolids.empty()) return 0;
 	c.rects = &nearRects;
+	c.solids = useSolids ? &nearSolids : nullptr;
 
-	// 1) con retraso 0 sobrevive alguna ruta? -> pasa intacto
-	if (anyRouteSurvives(c, 0)) {
-		if (optVerbose()) hudLog(std::string(modeName(m)) + (down ? " v" : " ^") + " ok (raw)");
-		return 0;
-	}
+	// misma simulacion pero exigiendo holgura extra
+	SimCtx cm = c;
+	cm.half = c.half + (m == Mode::Wave ? MARGIN_WAVE : MARGIN_OTHER);
 
-	// 2) ninguna ruta sobrevive: buscar el primer retraso que salve alguna ruta
+	// 1) seguro incluso con holgura: pasa intacto
+	if (anyRouteSurvives(cm, 0)) return 0;
+
+	// 2) con retraso 0: choque seguro, o solo rozando?
+	bool lethal = !anyRouteSurvives(c, 0);
+
 	int best = 0;
 	for (int d = 1; d <= limit; d++) {
-		if (over()) { hudLog(std::string(modeName(m)) + ": limite de CPU, input crudo"); return 0; }
-		if (anyRouteSurvives(c, d)) { best = d; break; }
+		if (over()) { hudLog(std::string(modeName(m)) + ": limite de CPU (auto)"); return 0; }
+		if (anyRouteSurvives(cm, d)) { best = d; break; }
 	}
-	if (best == 0) {
-		hudLog(std::string(modeName(m)) + (down ? " v" : " ^") + " sin salida (crudo)");
-		return 0;
+	if (best == 0 && lethal) {
+		for (int d = 1; d <= limit; d++) {
+			if (over()) { hudLog(std::string(modeName(m)) + ": limite de CPU (auto)"); return 0; }
+			if (anyRouteSurvives(c, d)) { best = d; break; }
+		}
+		if (best == 0) {
+			hudLog(std::string(modeName(m)) + (down ? " v" : " ^") + " sin salida");
+			return 0;
+		}
 	}
+	if (best == 0) return 0; // roce, pero ningun retraso mejora: crudo
 
 	// 3) margen de seguridad (no en wave)
-	if (m != Mode::Wave) {
-		int margin = (int)Mod::get()->getSettingValue<int64_t>("safety-ticks");
-		if (margin > 0 && best + margin <= limit && anyRouteSurvives(c, best + margin)) best += margin;
-	}
+	if (m != Mode::Wave && best + SAFETY_TICKS <= limit &&
+	    anyRouteSurvives(lethal ? c : cm, best + SAFETY_TICKS)) best += SAFETY_TICKS;
 
 	hudLog(std::string(modeName(m)) + (down ? " v" : " ^") + " +" + std::to_string(best) +
-		"t (" + std::to_string(best / 4.f).substr(0, 4) + "f)");
+		"t" + (lethal ? " !" : " ~"));
 	return best;
 }
 
 // ================================================================ guarda anti-spam
+// Solo se aparta con spam real: 5 inputs seguidos a menos de 1 frame entre si.
 static bool registerInput(PlayerBuf& st) {
-	int guard = (int)(Mod::get()->getSettingValue<double>("spam-frames") * 4.0);
-	int need = (int)Mod::get()->getSettingValue<int64_t>("spam-streak");
-	if (g_tick - st.lastInputTick <= guard) st.streak++; else st.streak = 1;
+	if (g_tick - st.lastInputTick <= SPAM_TICKS) st.streak++; else st.streak = 1;
 	st.lastInputTick = g_tick;
-	return optSpam() && st.streak >= need;
+	return st.streak >= SPAM_STREAK;
 }
 
 // ================================================================ hooks
@@ -488,9 +530,7 @@ class $modify(BufBaseGameLayer, GJBaseGameLayer) {
 			bool redundant = (down == st.applied);
 			st.lastDown = down;
 			if (matters && !redundant) {
-				if (spam) {
-					if (optVerbose()) hudLog(std::string(modeName(m)) + ": spam, input crudo");
-				} else {
+				if (!spam) {
 					int d = chooseDelay(m, pl, st, i, down);
 					if (d > 0) {
 						st.queue.push_back({down, g_tick + d});
@@ -652,8 +692,8 @@ class $modify(BufPlayLayer, PlayLayer) {
 		if (!Mod::get()->getSettingValue<bool>("show-button")) return;
 
 		auto label = CCLabelBMFont::create(STAGES[g_stage].label, "bigFont.fnt");
-		label->setScale(0.45f);
-		label->setOpacity(160);
+		label->setScale(0.55f);
+		label->setOpacity(200);
 		auto btn = CCMenuItemExt::createSpriteExtra(label, [label](CCObject*) {
 			g_stage = (g_stage + 1) % STAGE_COUNT;
 			Mod::get()->setSavedValue<int>("stage", g_stage);
@@ -669,6 +709,15 @@ class $modify(BufPlayLayer, PlayLayer) {
 
 	void postUpdate(float dt) {
 		PlayLayer::postUpdate(dt);
+		{
+			auto now = std::chrono::steady_clock::now();
+			if (g_haveFrame) {
+				double us = (double)std::chrono::duration_cast<std::chrono::microseconds>(now - g_lastFrame).count();
+				if (us > 2000.0 && us < 100000.0) g_frameUs = g_frameUs * 0.9 + us * 0.1;
+			}
+			g_lastFrame = now;
+			g_haveFrame = true;
+		}
 		if (g_hud && g_hudDirty) {
 			g_hudDirty = false;
 			std::string text;
