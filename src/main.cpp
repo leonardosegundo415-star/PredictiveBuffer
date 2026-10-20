@@ -1,15 +1,16 @@
-// Predictive Input Buffer v1.3 - prediccion por trayectoria (Windows / Android)
-// Etapas (ticks a 240 Hz): 2/2 -> 4/4 -> 8/8 -> 16/8 -> OFF  (all / wave)
+// Predictive Input Buffer v1.5 - prediccion por trayectoria (Windows / Android)
+// Etapas (ticks a 240 Hz): 2/2 -> 4/4 -> 8/8 -> 16/8 -> 32/16 -> 64/32 -> OFF  (all / wave)
 //
 //  ARO/ORBE : al pulsar se simula la trayectoria; si va a tocar un aro, el press se aplaza
-//             hasta el contacto. Si no, pasa al instante (zero-lag).
-//  WAVE     : cada cambio de direccion (press o release) se simula hacia adelante.
-//             Si con retraso 0 la wave choca con un hazard, se prueba retrasar la
-//             entrada 1..wave ticks y se elige el retraso que mas tarda en chocar
-//             (o que evita el choque). Si ya es seguro, pasa al instante.
+//             hasta el contacto. Si ya lo soltaste, se envia press + release en el contacto.
+//  ATERRIZAJE (cubo / bola / spider): si pulsas en el aire y sueltas antes de aterrizar,
+//             el salto se ejecuta al tocar el suelo si caes dentro de la ventana `all`.
+//  WAVE     : cada cambio de direccion se simula; si retrasarlo 1..wave ticks evita un
+//             choque por completo, se retrasa. Las entradas conservan su orden.
 #include <Geode/Geode.hpp>
 #include <Geode/modify/GJBaseGameLayer.hpp>
 #include <Geode/modify/PlayLayer.hpp>
+#include <algorithm>
 #include <cmath>
 #include <vector>
 #include <unordered_set>
@@ -17,13 +18,17 @@
 using namespace geode::prelude;
 
 struct Stage { int all; int wave; const char* label; };
-static constexpr Stage STAGES[5] = {
+static constexpr Stage STAGES[] = {
 	{2, 2, "Buf 2/2"},
 	{4, 4, "Buf 4/4"},
 	{8, 8, "Buf 8/8"},
 	{16, 8, "Buf 16/8"},
+	{32, 16, "Buf 32/16"},
+	{64, 32, "Buf 64/32"},
 	{0, 0, "Buf OFF"},
 };
+static constexpr int STAGE_COUNT = sizeof(STAGES) / sizeof(STAGES[0]);
+static constexpr int OFF_STAGE = STAGE_COUNT - 1;
 
 static int g_stage = 0;
 static int g_tick = 0;
@@ -31,23 +36,24 @@ static std::vector<RingObject*> g_rings;
 static std::vector<GameObject*> g_hazards;
 static std::vector<GameObject*> g_solids;
 
+struct WaveCmd { bool down; int tick; };
+
 struct PlayerBuf {
-	// aros
-	bool pressPending = false;
-	int pressTick = 0;
-	bool deferred = false;
-	int deferTick = 0;
-	// wave: entrada retrasada
-	bool queued = false;
-	bool queuedDown = false;
-	int applyTick = 0;
+	// press recordado (aros / aterrizaje)
+	bool pending = false;     // hay un press recordado
+	bool deferred = false;    // el press aun NO se envio al juego
+	bool released = false;    // el jugador ya solto desde ese press
+	bool landPending = false; // esperar aterrizaje
+	int pendTick = 0;
+	// cola de comandos retrasados (se conserva el orden)
+	std::vector<WaveCmd> queue;
+	bool lastDown = false;
 	// cinematica medida
 	bool haveLast = false;
 	float lastX = 0.f, lastY = 0.f;
 	float vx = 0.f, vy = 0.f, ay = 0.f;
 };
 static PlayerBuf g_p[2];
-// aros ya tocados por cada jugador (reemplaza m_hasBeenActivated, que no existe en estos bindings)
 static std::unordered_set<RingObject*> g_touched[2];
 
 static constexpr float RING_RADIUS = 30.f;
@@ -64,8 +70,14 @@ static int allLimit()  { return STAGES[g_stage].all; }
 static int waveLimit() { return STAGES[g_stage].wave; }
 
 static bool optRing()  { return Mod::get()->getSettingValue<bool>("ring-buffer"); }
+static bool optLand()  { return Mod::get()->getSettingValue<bool>("land-buffer"); }
 static bool optWave()  { return Mod::get()->getSettingValue<bool>("wave-buffer"); }
 static bool optLog()   { return Mod::get()->getSettingValue<bool>("log-saves"); }
+
+// cubo, bola y spider (modos donde saltar necesita estar en el suelo)
+static bool groundMode(PlayerObject* pl) {
+	return !(pl->m_isShip || pl->m_isBird || pl->m_isDart || pl->m_isRobot || pl->m_isSwing);
+}
 
 // ---------------------------------------------------------------- aros
 static bool ringActivated(RingObject* r, bool p1) {
@@ -113,7 +125,6 @@ static int chooseWaveDelay(PlayerObject* pl, const PlayerBuf& st, bool down) {
 	float x0 = pl->getPositionX();
 	float y0 = pl->getPositionY();
 
-	// radio del hitbox de la wave
 	float half = 5.f * std::fabs(pl->getScaleX());
 	{
 		auto pr = pl->getObjectRect();
@@ -121,7 +132,6 @@ static int chooseWaveDelay(PlayerObject* pl, const PlayerBuf& st, bool down) {
 	}
 	half += pad;
 
-	// pendiente: |vy|/|vx| medida; si esta pegada a techo/suelo usar 1 (45 grados)
 	float slope = 1.f;
 	if (std::fabs(st.vy) > 0.01f) slope = std::fabs(st.vy) / vx;
 	if (slope < 0.5f || slope > 3.f) slope = 1.f;
@@ -130,7 +140,6 @@ static int chooseWaveDelay(PlayerObject* pl, const PlayerBuf& st, bool down) {
 	float dirNew = (down ? 1.f : -1.f) * flip;
 	float dirOld = -dirNew;
 
-	// obstaculos cercanos (rects)
 	std::vector<CCRect> near;
 	float xMax = x0 + vx * H + 80.f;
 	auto collect = [&](std::vector<GameObject*>& list) {
@@ -138,14 +147,16 @@ static int chooseWaveDelay(PlayerObject* pl, const PlayerBuf& st, bool down) {
 			if (!o) continue;
 			float ox = o->getPositionX();
 			if (ox < x0 - 80.f || ox > xMax) continue;
-			near.push_back(o->getObjectRect());
+			CCRect r = o->getObjectRect();
+			r.origin.x += 1.f; r.origin.y += 1.f;
+			r.size.width -= 2.f; r.size.height -= 2.f;
+			near.push_back(r);
 		}
 	};
 	collect(g_hazards);
 	if (useSolids) collect(g_solids);
 	if (near.empty()) return 0;
 
-	// ticks hasta el choque con retraso d (H+1 = no choca en el horizonte)
 	auto ttc = [&](int d) {
 		float x = x0, y = y0;
 		for (int k = 1; k <= H; k++) {
@@ -159,22 +170,31 @@ static int chooseWaveDelay(PlayerObject* pl, const PlayerBuf& st, bool down) {
 		return H + 1;
 	};
 
-	int t0 = ttc(0);
-	if (t0 > H) return 0; // ya es seguro
-
-	int bestD = 0, bestT = t0;
+	if (ttc(0) > H) return 0;
 	for (int d = 1; d <= limit; d++) {
-		int t = ttc(d);
-		if (t > bestT) { bestT = t; bestD = d; }
-		if (t > H) { bestD = d; bestT = t; break; } // primer retraso totalmente seguro
+		if (ttc(d) > H) return d;
 	}
-	return bestD;
+	return 0;
 }
 
 // ---------------------------------------------------------------- hooks
 class $modify(BufBaseGameLayer, GJBaseGameLayer) {
+	// envia un press ahora; si el jugador ya habia soltado, encola el release 1 tick despues
+	void firePress(int i, bool alsoRelease) {
+		auto& st = g_p[i];
+		GJBaseGameLayer::handleButton(true, 1, i == 0);
+		if (alsoRelease) st.queue.push_back({false, g_tick + 1});
+	}
+
+	void clearPending(PlayerBuf& st) {
+		st.pending = false;
+		st.deferred = false;
+		st.landPending = false;
+		st.released = false;
+	}
+
 	void handleButton(bool down, int button, bool isPlayer1) {
-		if (g_stage == 4 || button != 1) {
+		if (g_stage == OFF_STAGE || button != 1) {
 			return GJBaseGameLayer::handleButton(down, button, isPlayer1);
 		}
 		int i = isPlayer1 ? 0 : 1;
@@ -182,21 +202,22 @@ class $modify(BufBaseGameLayer, GJBaseGameLayer) {
 		auto* pl = isPlayer1 ? m_player1 : m_player2;
 		if (!pl) return GJBaseGameLayer::handleButton(down, button, isPlayer1);
 
-		// si habia una entrada de wave retenida, aplicarla antes de la nueva
-		if (st.queued) {
-			st.queued = false;
-			GJBaseGameLayer::handleButton(st.queuedDown, 1, isPlayer1);
+		// entradas retenidas: esta va detras (no se altera el orden)
+		if (!st.queue.empty()) {
+			int t = std::max(g_tick, st.queue.back().tick + 1);
+			st.queue.push_back({down, t});
+			st.lastDown = down;
+			return;
 		}
 
 		// ---- WAVE
 		if (pl->m_isDart && optWave()) {
-			st.pressPending = false;
-			st.deferred = false;
-			int d = chooseWaveDelay(pl, st, down);
+			clearPending(st);
+			bool redundant = (down == st.lastDown);
+			st.lastDown = down;
+			int d = redundant ? 0 : chooseWaveDelay(pl, st, down);
 			if (d > 0) {
-				st.queued = true;
-				st.queuedDown = down;
-				st.applyTick = g_tick + d;
+				st.queue.push_back({down, g_tick + d});
 				if (optLog()) {
 					log::info("[InputBuffer] WAVE {} delayed +{} ticks ({:.2f} frames @ 60fps) [Limit: {}]",
 						down ? "press" : "release", d, d / 4.f, waveLimit());
@@ -205,47 +226,71 @@ class $modify(BufBaseGameLayer, GJBaseGameLayer) {
 			}
 			return GJBaseGameLayer::handleButton(down, button, isPlayer1);
 		}
+		st.lastDown = down;
 
-		// ---- ARO / ORBE
-		if (!optRing()) return GJBaseGameLayer::handleButton(down, button, isPlayer1);
+		bool ring = optRing();
+		bool land = optLand();
+		if (!ring && !land) return GJBaseGameLayer::handleButton(down, button, isPlayer1);
 
+		// ---- PRESS
 		if (down) {
-			st.pressTick = g_tick;
-			if (predictRingAhead(pl, st, isPlayer1, allLimit())) {
+			clearPending(st);
+			st.pendTick = g_tick;
+
+			if (ring && predictRingAhead(pl, st, isPlayer1, allLimit())) {
+				// aro en la trayectoria: esperar al contacto
+				st.pending = true;
 				st.deferred = true;
-				st.deferTick = g_tick;
-				st.pressPending = false;
+				if (land && groundMode(pl) && !pl->m_isOnGround) st.landPending = true;
 				return;
 			}
-			st.pressPending = true;
+			st.pending = true;
+			if (land && groundMode(pl) && !pl->m_isOnGround) st.landPending = true;
 			return GJBaseGameLayer::handleButton(true, button, isPlayer1);
 		}
 
-		if (st.deferred) {
-			st.deferred = false;
-			GJBaseGameLayer::handleButton(true, button, isPlayer1);
-		}
-		st.pressPending = false;
+		// ---- RELEASE
+		st.released = true;
+		if (st.deferred) return; // se emitira junto con el press diferido
 		GJBaseGameLayer::handleButton(false, button, isPlayer1);
 	}
 
 	void processCommands(float dt, bool isHalfTick, bool isLastTick) {
 		if (!isHalfTick) g_tick++;
-		if (g_stage != 4 && !isHalfTick) {
+
+		if (!isHalfTick) {
+			PlayerObject* players[2] = {m_player1, m_player2};
 			for (int i = 0; i < 2; i++) {
 				auto& st = g_p[i];
-				if (st.queued && g_tick >= st.applyTick) {
-					st.queued = false;
-					GJBaseGameLayer::handleButton(st.queuedDown, 1, i == 0);
+				auto* pl = players[i];
+
+				// 1) comandos retrasados (uno por tick, en orden)
+				if (!st.queue.empty() && g_tick >= st.queue.front().tick) {
+					WaveCmd c = st.queue.front();
+					st.queue.erase(st.queue.begin());
+					GJBaseGameLayer::handleButton(c.down, 1, i == 0);
 				}
-				if (st.deferred && g_tick - st.deferTick >= allLimit()) {
-					st.deferred = false;
-					st.pressPending = true;
-					st.pressTick = g_tick;
-					GJBaseGameLayer::handleButton(true, 1, i == 0);
+
+				if (g_stage == OFF_STAGE || !st.pending) continue;
+
+				// 2) expiro la ventana
+				if (g_tick - st.pendTick > allLimit()) {
+					if (st.deferred) firePress(i, st.released); // fallback: no se pierde el press
+					clearPending(st);
+					continue;
 				}
-				if (st.pressPending && g_tick - st.pressTick > allLimit()) {
-					st.pressPending = false;
+
+				// 3) aterrizaje (cubo/bola/spider) con el boton ya soltado
+				if (st.landPending && pl && pl->m_isOnGround) {
+					if (st.released && !st.deferred) {
+						int saved = g_tick - st.pendTick;
+						firePress(i, true);
+						if (optLog()) {
+							log::info("[InputBuffer] LAND SAVED +{} ticks ({:.2f} frames @ 60fps) [Limit: {}]",
+								saved, saved / 4.f, allLimit());
+						}
+					}
+					clearPending(st);
 				}
 			}
 		}
@@ -275,29 +320,21 @@ class $modify(BufBaseGameLayer, GJBaseGameLayer) {
 
 	void playerTouchedRing(PlayerObject* player, RingObject* ring) {
 		GJBaseGameLayer::playerTouchedRing(player, ring);
-		if (g_stage == 4 || !optRing()) return;
-
 		int i = (player == m_player1) ? 0 : 1;
-		auto& st = g_p[i];
 		g_touched[i].insert(ring);
+		if (g_stage == OFF_STAGE || !optRing()) return;
 
-		bool fire = false;
-		int saved = 0;
-		if (st.deferred) {
-			fire = true;
-			saved = g_tick - st.deferTick;
-			st.deferred = false;
-		} else if (st.pressPending && g_tick - st.pressTick <= allLimit()) {
-			fire = true;
-			saved = g_tick - st.pressTick;
-		}
-		if (fire) {
-			st.pressPending = false;
-			GJBaseGameLayer::handleButton(true, 1, i == 0);
-			if (optLog()) {
-				log::info("[InputBuffer] RING SAVED +{} ticks ({:.2f} frames @ 60fps) [Limit: {}]",
-					saved, saved / 4.f, allLimit());
-			}
+		auto& st = g_p[i];
+		if (!st.pending || g_tick - st.pendTick > allLimit()) return;
+
+		int saved = g_tick - st.pendTick;
+		bool wasReleased = st.released;
+		clearPending(st);
+		// re-dispara el press ahora que el aro toca al jugador (+ release si ya habia soltado)
+		firePress(i, wasReleased);
+		if (optLog()) {
+			log::info("[InputBuffer] RING SAVED +{} ticks ({:.2f} frames @ 60fps) [Limit: {}]",
+				saved, saved / 4.f, allLimit());
 		}
 	}
 };
@@ -323,7 +360,7 @@ class $modify(BufPlayLayer, PlayLayer) {
 		}
 
 		g_stage = Mod::get()->getSavedValue<int>("stage", 0);
-		if (g_stage < 0 || g_stage > 4) g_stage = 0;
+		if (g_stage < 0 || g_stage >= STAGE_COUNT) g_stage = 0;
 
 		if (!Mod::get()->getSettingValue<bool>("show-button")) return;
 
@@ -331,7 +368,7 @@ class $modify(BufPlayLayer, PlayLayer) {
 		label->setScale(0.45f);
 		label->setOpacity(160);
 		auto btn = CCMenuItemExt::createSpriteExtra(label, [label](CCObject*) {
-			g_stage = (g_stage + 1) % 5;
+			g_stage = (g_stage + 1) % STAGE_COUNT;
 			Mod::get()->setSavedValue<int>("stage", g_stage);
 			label->setString(STAGES[g_stage].label);
 			log::info("[InputBuffer] Stage -> {} ({} all / {} wave)",
