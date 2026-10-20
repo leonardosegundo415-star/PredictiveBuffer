@@ -24,3 +24,99 @@
 		"land-buffer": {
 			"type": "bool",
 			"name": "Buffer de aterrizaje (cubo/bola/spider)",
+			"description": "Si pulsas y sueltas en el aire, el salto se ejecuta al aterrizar dentro de la ventana.",
+			"default": true
+		},
+		"wave-buffer": {
+			"type": "bool",
+			"name": "Buffer de wave (prediccion de hazards)",
+			"description": "Retrasa un cambio de direccion de la wave si la trayectoria predice un choque.",
+			"default": true
+		},
+		"wave-solids": {
+			"type": "bool",
+			"name": "Wave: considerar bloques solidos",
+			"description": "Ademas de pinchos/sierras. Puede dar falsos positivos al deslizarse sobre bloques.",
+			"default": false
+		},
+		"wave-horizon": {
+			"type": "int",
+			"name": "Horizonte de simulacion (ticks, todos los vehiculos)",
+			"default": 12,
+			"min": 4,
+			"max": 40
+		},
+		"wave-padding": {
+			"type": "float",
+			"name": "Wave: margen de seguridad (px)",
+			"default": 0.0,
+			"min": 0.0,
+			"max": 4.0
+		},
+		"vehicle-buffer": {
+			"type": "bool",
+			"name": "Buffer de nave / UFO / swing / cubo (simulacion)",
+			"description": "Retrasa un input solo si ninguna ruta futura sobrevive sin retraso y alguna si sobrevive con retraso.",
+			"default": true
+		},
+		"spam-guard": {
+			"type": "bool",
+			"name": "Guarda anti-spam",
+			"description": "Si haces varios inputs muy seguidos, el buffer se aparta y deja el input crudo.",
+			"default": true
+		},
+		"spam-frames": {
+			"type": "float",
+			"name": "Anti-spam: intervalo (frames @60)",
+			"default": 2.0,
+			"min": 0.0,
+			"max": 6.0
+		},
+		"spam-streak": {
+			"type": "int",
+			"name": "Anti-spam: inputs seguidos",
+			"default": 3,
+			"min": 2,
+			"max": 10
+		},
+		"safety-ticks": {
+			"type": "int",
+			"name": "Margen de seguridad (ticks)",
+			"description": "Tras hallar el primer retraso seguro, prueba estos ticks extra si sigue siendo seguro. No se usa en wave.",
+			"default": 1,
+			"min": 0,
+			"max": 4
+		},
+		"cpu-budget-us": {
+			"type": "int",
+			"name": "Limite de CPU por input (microsegundos)",
+			"description": "Si la simulacion tarda mas, se deja el input crudo. 0 = sin limite.",
+			"default": 3000,
+			"min": 0,
+			"max": 20000
+		},
+		"hud-readout": {
+			"type": "bool",
+			"name": "Panel de log en pantalla",
+			"description": "Arriba a la derecha: cada decision del buffer y la ultima accion antes de cada reinicio.",
+			"default": true
+		},
+		"hud-lines": {
+			"type": "int",
+			"name": "Panel de log: lineas",
+			"default": 6,
+			"min": 3,
+			"max": 20
+		},
+		"hud-verbose": {
+			"type": "bool",
+			"name": "Panel de log: mostrar inputs seguros",
+			"default": true
+		},
+		"log-saves": {
+			"type": "bool",
+			"name": "Registrar salvadas en el log",
+			"default": true
+		}
+	}
+}
