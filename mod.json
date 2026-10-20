@@ -4,7 +4,7 @@
 		"win": "2.2081",
 		"android": "2.2081"
 	},
-	"version": "v1.3.0",
+	"version": "v1.5.0",
 	"id": "ai.predictivebuffer",
 	"name": "Predictive Input Buffer",
 	"developer": "lilWC",
@@ -19,6 +19,12 @@
 		"ring-buffer": {
 			"type": "bool",
 			"name": "Buffer de aros y orbes",
+			"default": true
+		},
+		"land-buffer": {
+			"type": "bool",
+			"name": "Buffer de aterrizaje (cubo/bola/spider)",
+			"description": "Si pulsas y sueltas en el aire, el salto se ejecuta al aterrizar dentro de la ventana.",
 			"default": true
 		},
 		"wave-buffer": {
@@ -36,14 +42,14 @@
 		"wave-horizon": {
 			"type": "int",
 			"name": "Wave: horizonte de prediccion (ticks)",
-			"default": 12,
+			"default": 8,
 			"min": 4,
 			"max": 40
 		},
 		"wave-padding": {
 			"type": "float",
 			"name": "Wave: margen de seguridad (px)",
-			"default": 0.5,
+			"default": 0.0,
 			"min": 0.0,
 			"max": 4.0
 		},
