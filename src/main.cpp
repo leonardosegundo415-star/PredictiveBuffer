@@ -82,6 +82,14 @@ static void hudLog(const std::string& s) {
 	g_hudDirty = true;
 }
 
+// ================================================================ overlay de depuracion
+// Dibuja lo que el mod "ve": hazards (amarillo), bloques (naranja), hitbox del jugador (blanco),
+// ruta cruda (rojo, hasta el choque) y ruta con retraso elegido (verde).
+static bool g_overlay = false;
+static CCDrawNode* g_draw = nullptr;
+static std::vector<CCPoint> g_pathRaw, g_pathBest;
+static float g_dbgHalf = 0.f;
+
 // ================================================================ vehiculos y modelo aprendido
 enum class Mode { None = 0, Wave, Ship, Ufo, Swing, Cube };
 static const char* modeName(Mode m) {
@@ -257,11 +265,12 @@ struct SimCtx {
 
 // Simula H ticks. Entrada: prevDown durante `d` ticks, luego firstDown. Si futureK > 0, tras
 // futureK ticks de firstDown el jugador vuelve a prevDown (un "tap" o cambio posterior).
-static bool survives(const SimCtx& c, int d, int futureK) {
+static bool survives(const SimCtx& c, int d, int futureK, std::vector<CCPoint>* trace = nullptr) {
 	float x = c.x0;
 	float yn = c.yn0, vyn = c.vyn0;
 	bool prev = c.prevDown;
 	bool grounded = c.grounded;
+	float floorN = c.yn0;   // suelo actual (cubo): sube al aterrizar sobre un bloque
 	float dirG = c.swingDir0;
 	const Learn& L = *c.L;
 
@@ -299,7 +308,7 @@ static bool survives(const SimCtx& c, int d, int futureK) {
 				} else {
 					vyn += L.g;
 					yn += vyn;
-					if (yn <= c.yn0) { yn = c.yn0; vyn = 0.f; grounded = true; }
+					if (yn <= floorN) { yn = floorN; vyn = 0.f; grounded = true; }
 				}
 				break;
 			default: break;
@@ -307,19 +316,23 @@ static bool survives(const SimCtx& c, int d, int futureK) {
 		x += c.vx;
 		float y = yn * c.f;
 
-		// bloques solidos (solo wave): golpe de lado = muerte; por arriba/abajo desliza
-		if (c.mode == Mode::Wave && c.solids) {
+		// bloques solidos (todos los vehiculos): golpe de lado = muerte; por arriba/abajo desliza o aterriza
+		if (c.solids) {
 			for (auto& r : *c.solids) {
 				float ox = std::min(x + c.half, r.origin.x + r.size.width) - std::max(x - c.half, r.origin.x);
 				float oy = std::min(y + c.half, r.origin.y + r.size.height) - std::max(y - c.half, r.origin.y);
 				if (ox > 0.f && oy > 0.f) {
 					if (ox < oy * 0.8f) return false; // choque de lado
 					float cy = r.origin.y + r.size.height * 0.5f;
-					y = (y >= cy) ? (r.origin.y + r.size.height + c.half) : (r.origin.y - c.half);
+					bool fromTop = (y >= cy);
+					y = fromTop ? (r.origin.y + r.size.height + c.half) : (r.origin.y - c.half);
 					yn = y * c.f;
+					if (c.mode != Mode::Wave) vyn = 0.f;
+					if (c.mode == Mode::Cube && ((c.f > 0.f) == fromTop)) { grounded = true; floorN = yn; }
 				}
 			}
 		}
+		if (trace && trace->size() < 80) trace->push_back(CCPoint{x, y});
 		for (auto& r : *c.rects) {
 			if (boxHit(r, x, y, c.half)) return false;
 		}
@@ -420,15 +433,21 @@ static int chooseDelay(Mode m, PlayerObject* pl, PlayerBuf& st, int idx, bool do
 		}
 	};
 	collect(g_hazards, nearRects, true);
-	bool useSolids = (m == Mode::Wave);
-	if (useSolids) collect(g_solids, nearSolids, false);
+	bool useSolids = true;
+	collect(g_solids, nearSolids, false);
 	if (nearRects.empty() && nearSolids.empty()) return 0;
 	c.rects = &nearRects;
 	c.solids = useSolids ? &nearSolids : nullptr;
+	g_dbgHalf = c.half;
 
 	// misma simulacion pero exigiendo holgura extra
 	SimCtx cm = c;
 	cm.half = c.half + (m == Mode::Wave ? MARGIN_WAVE : MARGIN_OTHER);
+
+	if (g_overlay) {
+		g_pathRaw.clear(); g_pathBest.clear();
+		survives(c, 0, 0, &g_pathRaw);
+	}
 
 	// 1) seguro incluso con holgura: pasa intacto
 	if (anyRouteSurvives(cm, 0)) return 0;
@@ -457,6 +476,11 @@ static int chooseDelay(Mode m, PlayerObject* pl, PlayerBuf& st, int idx, bool do
 	if (m != Mode::Wave && best + SAFETY_TICKS <= limit &&
 	    anyRouteSurvives(lethal ? c : cm, best + SAFETY_TICKS)) best += SAFETY_TICKS;
 
+	if (g_overlay) {
+		g_pathRaw.clear(); g_pathBest.clear();
+		survives(c, 0, 0, &g_pathRaw);
+		survives(c, best, 0, &g_pathBest);
+	}
 	hudLog(std::string(modeName(m)) + (down ? " v" : " ^") + " +" + std::to_string(best) +
 		"t" + (lethal ? " !" : " ~"));
 	return best;
@@ -658,6 +682,9 @@ class $modify(BufPlayLayer, PlayLayer) {
 		resetBuffer();
 		g_hudLines.clear();
 		g_hud = nullptr;
+		g_draw = nullptr;
+		g_pathRaw.clear();
+		g_pathBest.clear();
 
 		g_rings.clear();
 		g_hazards.clear();
@@ -689,6 +716,12 @@ class $modify(BufPlayLayer, PlayLayer) {
 			this->addChild(g_hud, 201);
 		}
 
+		g_overlay = Mod::get()->getSavedValue<bool>("overlay", false);
+		if (m_objectLayer) {
+			g_draw = CCDrawNode::create();
+			m_objectLayer->addChild(g_draw, 1000);
+		}
+
 		if (!Mod::get()->getSettingValue<bool>("show-button")) return;
 
 		auto label = CCLabelBMFont::create(STAGES[g_stage].label, "bigFont.fnt");
@@ -700,10 +733,21 @@ class $modify(BufPlayLayer, PlayLayer) {
 			label->setString(STAGES[g_stage].label);
 			hudLog(std::string("Etapa -> ") + STAGES[g_stage].label);
 		});
+		auto verLabel = CCLabelBMFont::create(g_overlay ? "Ver ON" : "Ver", "bigFont.fnt");
+		verLabel->setScale(0.55f);
+		verLabel->setOpacity(200);
+		auto verBtn = CCMenuItemExt::createSpriteExtra(verLabel, [verLabel](CCObject*) {
+			g_overlay = !g_overlay;
+			Mod::get()->setSavedValue<bool>("overlay", g_overlay);
+			verLabel->setString(g_overlay ? "Ver ON" : "Ver");
+			if (!g_overlay && g_draw) g_draw->clear();
+		});
 		auto menu = CCMenu::create();
 		menu->setPosition({0, 0});
 		btn->setPosition({55.f, 18.f});
+		verBtn->setPosition({150.f, 18.f});
 		menu->addChild(btn);
+		menu->addChild(verBtn);
 		this->addChild(menu, 200);
 	}
 
@@ -717,6 +761,34 @@ class $modify(BufPlayLayer, PlayLayer) {
 			}
 			g_lastFrame = now;
 			g_haveFrame = true;
+		}
+		if (g_overlay && g_draw && m_player1) {
+			g_draw->clear();
+			float px = m_player1->getPositionX();
+			float py = m_player1->getPositionY();
+			auto box = [&](const CCRect& r, ccColor4F col) {
+				CCPoint v[4] = {{r.origin.x, r.origin.y}, {r.origin.x + r.size.width, r.origin.y},
+				                {r.origin.x + r.size.width, r.origin.y + r.size.height}, {r.origin.x, r.origin.y + r.size.height}};
+				g_draw->drawPolygon(v, 4, ccColor4F{0.f, 0.f, 0.f, 0.f}, 1.0f, col);
+			};
+			int drawn = 0;
+			for (auto* o : g_hazards) {
+				if (!o || std::fabs(o->getPositionX() - px) > 260.f) continue;
+				box(o->getObjectRect(), ccColor4F{1.f, 1.f, 0.f, 1.f});
+				if (++drawn > 200) break;
+			}
+			drawn = 0;
+			for (auto* o : g_solids) {
+				if (!o || std::fabs(o->getPositionX() - px) > 260.f) continue;
+				box(o->getObjectRect(), ccColor4F{1.f, 0.55f, 0.f, 1.f});
+				if (++drawn > 200) break;
+			}
+			float h = g_dbgHalf > 0.f ? g_dbgHalf : 5.f;
+			box(CCRect{CCPoint{px - h, py - h}, CCSize{2.f * h, 2.f * h}}, ccColor4F{1.f, 1.f, 1.f, 1.f});
+			for (size_t k = 1; k < g_pathRaw.size(); k++)
+				g_draw->drawSegment(g_pathRaw[k - 1], g_pathRaw[k], 0.8f, ccColor4F{1.f, 0.f, 0.f, 1.f});
+			for (size_t k = 1; k < g_pathBest.size(); k++)
+				g_draw->drawSegment(g_pathBest[k - 1], g_pathBest[k], 0.8f, ccColor4F{0.f, 1.f, 0.2f, 1.f});
 		}
 		if (g_hud && g_hudDirty) {
 			g_hudDirty = false;
@@ -738,6 +810,7 @@ class $modify(BufPlayLayer, PlayLayer) {
 	void onQuit() {
 		resetBuffer();
 		g_hud = nullptr;
+		g_draw = nullptr;
 		g_rings.clear();
 		g_hazards.clear();
 		g_solids.clear();
