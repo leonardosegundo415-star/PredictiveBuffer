@@ -1,4 +1,4 @@
-// Predictive Input Buffer v1.6 - simulacion de rutas por vehiculo (Windows / Android)
+// Predictive Input Buffer v2.0 - simulacion de rutas por vehiculo (Windows / Android)
 //
 // Etapas (ticks a 240 Hz): 2/2 -> 4/4 -> 8/8 -> 16/8 -> 32/16 -> 64/32 -> OFF  (all / hold)
 //   "all"  = ventana para cubo, UFO y swing.   "hold" = ventana para wave y nave.
@@ -17,6 +17,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdio>
 #include <string>
 #include <unordered_set>
 #include <vector>
@@ -42,6 +43,7 @@ static int g_tick = 0;
 static std::vector<RingObject*> g_rings;
 static std::vector<GameObject*> g_hazards;
 static std::vector<GameObject*> g_solids;
+static std::vector<GameObject*> g_slopes;
 
 // ================================================================ ajustes
 static bool optRing() { return Mod::get()->getSettingValue<bool>("ring-buffer"); }
@@ -73,8 +75,8 @@ static CCLabelBMFont* g_hud = nullptr;
 static bool g_hudDirty = false;
 static std::string g_last; // ultima decision, para el reporte al reiniciar
 
-static void hudLog(const std::string& s) {
-	g_last = s;
+static void hudLog(const std::string& s, bool track = true) {
+	if (track) g_last = s;
 	log::info("[InputBuffer] {}", s);
 	if (!optHud()) return;
 	g_hudLines.push_back(s);
@@ -158,16 +160,54 @@ static std::unordered_set<RingObject*> g_touched[2];
 
 static constexpr float RING_RADIUS = 30.f;
 
+// ---- base de tiempo: se mide cuantas veces por segundo corre processCommands.
+// Las etapas estan definidas en "ticks" de 1/240 s; aqui se convierten a llamadas reales.
+static double g_cps = 240.0;
+static int g_cpsCount = 0;
+static bool g_cpsStarted = false;
+static bool g_cpsHave = false;
+static std::chrono::steady_clock::time_point g_cpsStart;
+
+static void sampleCps() {
+	auto now = std::chrono::steady_clock::now();
+	if (!g_cpsStarted) { g_cpsStarted = true; g_cpsStart = now; g_cpsCount = 0; return; }
+	g_cpsCount++;
+	double el = std::chrono::duration<double>(now - g_cpsStart).count();
+	if (el >= 0.5) {
+		if (g_cpsCount >= 20) {
+			double v = g_cpsCount / el;
+			if (v > 30.0 && v < 2000.0) { g_cps = g_cpsHave ? g_cps * 0.6 + v * 0.4 : v; g_cpsHave = true; }
+		}
+		g_cpsStart = now;
+		g_cpsCount = 0;
+	}
+}
+static int toCalls(int ticks240) {
+	if (ticks240 <= 0) return 0;
+	return std::max(1, (int)std::lround(ticks240 * g_cps / 240.0));
+}
+// constantes de GD estan en unidades por frame a 60 fps; se pasan a "por llamada"
+static float perCallV(float v60) { return (float)(v60 * 60.0 / g_cps); }
+static float perCallA(float a60) { double k = 60.0 / g_cps; return (float)(a60 * k * k); }
+
+static int g_lastMsg[6] = {-100000, -100000, -100000, -100000, -100000, -100000};
+static bool canLog(int mode) {
+	if (g_tick - g_lastMsg[mode] < toCalls(240)) return false; // 1 mensaje por segundo y modo
+	g_lastMsg[mode] = g_tick;
+	return true;
+}
+
 static void resetBuffer() {
 	g_tick = 0;
 	g_p[0] = PlayerBuf{};
 	g_p[1] = PlayerBuf{};
 	g_touched[0].clear();
 	g_touched[1].clear();
+	for (int& v : g_lastMsg) v = -100000;
 }
 
-static int allLimit()  { return STAGES[g_stage].all; }
-static int holdLimit() { return STAGES[g_stage].hold; }
+static int allLimit()  { return toCalls(STAGES[g_stage].all); }
+static int holdLimit() { return toCalls(STAGES[g_stage].hold); }
 static int limitFor(Mode m) {
 	return (m == Mode::Wave || m == Mode::Ship) ? holdLimit() : allLimit();
 }
@@ -187,6 +227,12 @@ static void learnPhysics(int i, PlayerObject* pl) {
 	float vyn = st.vy * f;
 	float ayn = st.ay * f;
 	bool air = !pl->m_isOnGround;
+
+	// rechazar muestras absurdas (respawn, teletransporte, portales)
+	if (std::fabs(vyn) > perCallV(12.f) || std::fabs(ayn) > perCallA(1.2f)) {
+		st.wasGround = pl->m_isOnGround;
+		return;
+	}
 
 	switch (m) {
 		case Mode::Ship:
@@ -250,6 +296,13 @@ static bool boxHit(const CCRect& r, float x, float y, float h) {
 	         y + h < r.origin.y || y - h > r.origin.y + r.size.height);
 }
 
+// rampa: segmento de hipotenusa (y0 en el borde izquierdo, y1 en el derecho) dentro de su rect
+struct SlopeSeg {
+	CCRect r;
+	float y0, y1;
+	bool floor; // true = el solido esta DEBAJO de la hipotenusa (se pisa por arriba)
+};
+
 struct SimCtx {
 	Mode mode;
 	float x0, vx, f, slope, half;
@@ -261,6 +314,7 @@ struct SimCtx {
 	const Learn* L;
 	const std::vector<CCRect>* rects;   // hazards (letales al tocar)
 	const std::vector<CCRect>* solids;  // bloques solidos (wave: letal de lado, desliza por arriba/abajo)
+	const std::vector<SlopeSeg>* slopes; // rampas (triangulos)
 };
 
 // Simula H ticks. Entrada: prevDown durante `d` ticks, luego firstDown. Si futureK > 0, tras
@@ -332,6 +386,27 @@ static bool survives(const SimCtx& c, int d, int futureK, std::vector<CCPoint>* 
 				}
 			}
 		}
+		// rampas: se desliza por la hipotenusa; un golpe contra su pared mata
+		if (c.slopes) {
+			for (auto& sg : *c.slopes) {
+				const CCRect& r = sg.r;
+				float ox = std::min(x + c.half, r.origin.x + r.size.width) - std::max(x - c.half, r.origin.x);
+				float oy = std::min(y + c.half, r.origin.y + r.size.height) - std::max(y - c.half, r.origin.y);
+				if (ox <= 0.f || oy <= 0.f) continue;
+				bool up = sg.y1 > sg.y0;
+				float cx = sg.floor ? (up ? x + c.half : x - c.half) : (up ? x - c.half : x + c.half);
+				cx = std::max(r.origin.x, std::min(r.origin.x + r.size.width, cx));
+				float t = (r.size.width > 0.f) ? (cx - r.origin.x) / r.size.width : 0.f;
+				float hy = sg.y0 + (sg.y1 - sg.y0) * t;
+				float pen = sg.floor ? (hy - (y - c.half)) : ((y + c.half) - hy);
+				if (pen <= 0.f) continue;
+				if (pen > 2.5f * c.vx + 2.f) return false; // pared de la rampa
+				y += sg.floor ? pen : -pen;
+				yn = y * c.f;
+				if (c.mode != Mode::Wave) vyn = 0.f;
+				if (c.mode == Mode::Cube && ((c.f > 0.f) == sg.floor)) { grounded = true; floorN = yn; }
+			}
+		}
 		if (trace && trace->size() < 80) trace->push_back(CCPoint{x, y});
 		for (auto& r : *c.rects) {
 			if (boxHit(r, x, y, c.half)) return false;
@@ -346,11 +421,31 @@ static constexpr int FUTURE_K[] = {0, 8, 12, 16, 24};
 
 // true si ALGUNA ruta futura razonable sobrevive con retraso d
 static bool anyRouteSurvives(const SimCtx& c, int d) {
-	for (int k : FUTURE_K) {
+	for (int k0 : FUTURE_K) {
+		int k = k0 ? toCalls(k0) : 0;
 		if (k > c.H) break;
 		if (survives(c, d, k)) return true;
 	}
 	return false;
+}
+
+// Lee la geometria de una rampa usando las funciones del propio juego.
+// Devuelve false si la rampa es degenerada.
+static bool slopeInfo(GameObject* o, SlopeSeg& out) {
+	if (!o) return false;
+	CCRect r = o->getObjectRect();
+	if (r.size.width < 1.f || r.size.height < 1.f) return false;
+	float y0 = (float)o->slopeYPos(r.origin.x);
+	float y1 = (float)o->slopeYPos(r.origin.x + r.size.width);
+	bool up = y1 > y0;
+	bool wallLeft = o->slopeWallLeft();
+	// suelo = solido debajo de la hipotenusa: pared a la izquierda si baja hacia la derecha
+	bool floorTop = (wallLeft && !up) || (!wallLeft && up);
+	out.r = r;
+	out.y0 = y0;
+	out.y1 = y1;
+	out.floor = floorTop;
+	return true;
 }
 
 // Elige cuantos ticks retrasar el input (0 = pasa al instante).
@@ -362,12 +457,21 @@ static int chooseDelay(Mode m, PlayerObject* pl, PlayerBuf& st, int idx, bool do
 	float vx = std::fabs(st.vx);
 	if (vx < 0.01f) return 0;
 
-	auto& L = g_learn[idx][(int)m];
+	Learn Lp = g_learn[idx][(int)m];
+	auto& L = Lp;
 	bool ready = true;
+	if (m == Mode::Cube) {
+		// valores conocidos del juego (por frame a 60 fps), convertidos a "por llamada"
+		float jPrior = perCallV(11.18f);
+		float gPrior = -perCallA(0.958f);
+		if (!(L.nJump >= 1 && L.jump > 0.6f * jPrior && L.jump < 1.4f * jPrior)) L.jump = jPrior;
+		if (!(L.nG >= 6 && L.g < 0.6f * gPrior && L.g > 1.4f * gPrior)) L.g = gPrior;
+		L.nJump = 1; L.nG = 6;
+	}
 	switch (m) {
 		case Mode::Ship:  ready = L.nHold >= 6 && L.nFree >= 6; break;
 		case Mode::Ufo:   ready = L.nJump >= 1 && L.nG >= 6; break;
-		case Mode::Cube:  ready = pl->m_isOnGround && L.nJump >= 1 && L.nG >= 6; break;
+		case Mode::Cube:  ready = pl->m_isOnGround; break;
 		case Mode::Swing: ready = L.nG >= 6; break;
 		default: break;
 	}
@@ -435,9 +539,19 @@ static int chooseDelay(Mode m, PlayerObject* pl, PlayerBuf& st, int idx, bool do
 	collect(g_hazards, nearRects, true);
 	bool useSolids = true;
 	collect(g_solids, nearSolids, false);
-	if (nearRects.empty() && nearSolids.empty()) return 0;
+	std::vector<SlopeSeg> nearSlopes;
+	for (auto* o : g_slopes) {
+		if (!o) continue;
+		float ox = o->getPositionX();
+		if (ox < c.x0 - 80.f || ox > xMax) continue;
+		SlopeSeg sg;
+		if (slopeInfo(o, sg)) nearSlopes.push_back(sg);
+		if (nearSlopes.size() >= 48) break;
+	}
+	if (nearRects.empty() && nearSolids.empty() && nearSlopes.empty()) return 0;
 	c.rects = &nearRects;
 	c.solids = useSolids ? &nearSolids : nullptr;
+	c.slopes = &nearSlopes;
 	g_dbgHalf = c.half;
 
 	// misma simulacion pero exigiendo holgura extra
@@ -457,16 +571,16 @@ static int chooseDelay(Mode m, PlayerObject* pl, PlayerBuf& st, int idx, bool do
 
 	int best = 0;
 	for (int d = 1; d <= limit; d++) {
-		if (over()) { hudLog(std::string(modeName(m)) + ": limite de CPU (auto)"); return 0; }
+		if (over()) { if (canLog((int)m)) hudLog(std::string(modeName(m)) + ": limite de CPU (auto)"); return 0; }
 		if (anyRouteSurvives(cm, d)) { best = d; break; }
 	}
 	if (best == 0 && lethal) {
 		for (int d = 1; d <= limit; d++) {
-			if (over()) { hudLog(std::string(modeName(m)) + ": limite de CPU (auto)"); return 0; }
+			if (over()) { if (canLog((int)m)) hudLog(std::string(modeName(m)) + ": limite de CPU (auto)"); return 0; }
 			if (anyRouteSurvives(c, d)) { best = d; break; }
 		}
 		if (best == 0) {
-			hudLog(std::string(modeName(m)) + (down ? " v" : " ^") + " sin salida");
+			if (canLog((int)m)) hudLog(std::string(modeName(m)) + (down ? " v" : " ^") + " sin salida");
 			return 0;
 		}
 	}
@@ -481,15 +595,18 @@ static int chooseDelay(Mode m, PlayerObject* pl, PlayerBuf& st, int idx, bool do
 		survives(c, 0, 0, &g_pathRaw);
 		survives(c, best, 0, &g_pathBest);
 	}
-	hudLog(std::string(modeName(m)) + (down ? " v" : " ^") + " +" + std::to_string(best) +
-		"t" + (lethal ? " !" : " ~"));
+	{
+		char buf[24];
+		std::snprintf(buf, sizeof(buf), " +%dc %.1ff", best, best * 60.0 / g_cps);
+		hudLog(std::string(modeName(m)) + (down ? " v" : " ^") + buf + (lethal ? " !" : " ~"));
+	}
 	return best;
 }
 
 // ================================================================ guarda anti-spam
 // Solo se aparta con spam real: 5 inputs seguidos a menos de 1 frame entre si.
 static bool registerInput(PlayerBuf& st) {
-	if (g_tick - st.lastInputTick <= SPAM_TICKS) st.streak++; else st.streak = 1;
+	if (g_tick - st.lastInputTick <= toCalls(SPAM_TICKS)) st.streak++; else st.streak = 1;
 	st.lastInputTick = g_tick;
 	return st.streak >= SPAM_STREAK;
 }
@@ -598,7 +715,7 @@ class $modify(BufBaseGameLayer, GJBaseGameLayer) {
 	}
 
 	void processCommands(float dt, bool isHalfTick, bool isLastTick) {
-		if (!isHalfTick) g_tick++;
+		if (!isHalfTick) { g_tick++; sampleCps(); }
 
 		if (!isHalfTick) {
 			PlayerObject* players[2] = {m_player1, m_player2};
@@ -648,10 +765,15 @@ class $modify(BufBaseGameLayer, GJBaseGameLayer) {
 			if (st.haveLast) {
 				float nvx = x - st.lastX;
 				float nvy = y - st.lastY;
-				st.ay = nvy - st.vy;
-				st.vx = nvx;
-				st.vy = nvy;
-				learnPhysics(i, pl);
+				if (std::fabs(nvx) > 30.f || std::fabs(nvy) > 30.f) {
+					// teletransporte (respawn / portal): descartar la medicion
+					st.vx = 0.f; st.vy = 0.f; st.ay = 0.f;
+				} else {
+					st.ay = nvy - st.vy;
+					st.vx = nvx;
+					st.vy = nvy;
+					learnPhysics(i, pl);
+				}
 			}
 			st.lastX = x;
 			st.lastY = y;
@@ -689,6 +811,7 @@ class $modify(BufPlayLayer, PlayLayer) {
 		g_rings.clear();
 		g_hazards.clear();
 		g_solids.clear();
+		g_slopes.clear();
 		if (m_objects) {
 			for (auto* obj : CCArrayExt<GameObject*>(m_objects)) {
 				if (!obj) continue;
@@ -698,6 +821,10 @@ class $modify(BufPlayLayer, PlayLayer) {
 				}
 				if (obj->m_objectType == GameObjectType::Hazard) g_hazards.push_back(obj);
 				else if (obj->m_objectType == GameObjectType::Solid) g_solids.push_back(obj);
+				else if (obj->m_objectType == GameObjectType::Slope) {
+					if (obj->m_slopeIsHazard) g_hazards.push_back(obj);
+					else g_slopes.push_back(obj);
+				}
 			}
 		}
 
@@ -783,6 +910,21 @@ class $modify(BufPlayLayer, PlayLayer) {
 				box(o->getObjectRect(), ccColor4F{1.f, 0.55f, 0.f, 1.f});
 				if (++drawn > 200) break;
 			}
+			drawn = 0;
+			for (auto* o : g_slopes) {
+				if (!o || std::fabs(o->getPositionX() - px) > 260.f) continue;
+				SlopeSeg sg;
+				if (!slopeInfo(o, sg)) continue;
+				const CCRect& r = sg.r;
+				bool up = sg.y1 > sg.y0;
+				CCPoint a{r.origin.x, sg.y0};
+				CCPoint b{r.origin.x + r.size.width, sg.y1};
+				CCPoint cc = sg.floor ? (up ? CCPoint{r.origin.x + r.size.width, r.origin.y} : CCPoint{r.origin.x, r.origin.y})
+				                      : (up ? CCPoint{r.origin.x, r.origin.y + r.size.height} : CCPoint{r.origin.x + r.size.width, r.origin.y + r.size.height});
+				CCPoint v[3] = {a, b, cc};
+				g_draw->drawPolygon(v, 3, ccColor4F{0.f, 0.f, 0.f, 0.f}, 1.0f, ccColor4F{1.f, 0.f, 1.f, 1.f});
+				if (++drawn > 120) break;
+			}
 			float h = g_dbgHalf > 0.f ? g_dbgHalf : 5.f;
 			box(CCRect{CCPoint{px - h, py - h}, CCSize{2.f * h, 2.f * h}}, ccColor4F{1.f, 1.f, 1.f, 1.f});
 			for (size_t k = 1; k < g_pathRaw.size(); k++)
@@ -802,7 +944,7 @@ class $modify(BufPlayLayer, PlayLayer) {
 	}
 
 	void resetLevel() {
-		if (!g_last.empty() && g_tick > 0) hudLog("RESET | ultima: " + g_last);
+		if (!g_last.empty() && g_tick > 0) hudLog("RESET | ultima: " + g_last, false);
 		PlayLayer::resetLevel();
 		resetBuffer();
 	}
@@ -814,6 +956,7 @@ class $modify(BufPlayLayer, PlayLayer) {
 		g_rings.clear();
 		g_hazards.clear();
 		g_solids.clear();
+		g_slopes.clear();
 		PlayLayer::onQuit();
 	}
 };
